@@ -2,6 +2,10 @@
 Main AI Agent interface for schedule, task, and payment management.
 """
 from datetime import datetime, timedelta
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
 from calendar_manager import CalendarManager
 from task_generator import TaskGenerator
 from payment_reminder import PaymentReminder
@@ -30,24 +34,112 @@ class ScheduleAgent:
             self.calendar_monitor = None
         print("Agent initialized successfully!")
     
-    def schedule_meeting(self, duration_minutes=60, days_ahead=14):
+    def resolve_timezone(self, timezone_input: str) -> str:
+        """
+        Resolve a timezone input (e.g., 'India', 'Tokyo') to an IANA timezone string.
+        
+        Args:
+            timezone_input: User input for timezone
+            
+        Returns:
+            IANA timezone string (e.g., 'Asia/Kolkata') or 'UTC' if unresolved
+        """
+        if not timezone_input or timezone_input.upper() == 'UTC':
+            return 'UTC'
+            
+        # Try direct ZoneInfo resolution first
+        try:
+            ZoneInfo(timezone_input)
+            return timezone_input
+        except Exception:
+            pass
+            
+        # Common aliases
+        aliases = {
+            'india': 'Asia/Kolkata',
+            'ist': 'Asia/Kolkata',
+            'japan': 'Asia/Tokyo',
+            'jst': 'Asia/Tokyo',
+            'uk': 'Europe/London',
+            'london': 'Europe/London',
+            'ny': 'America/New_York',
+            'nyc': 'America/New_York',
+            'sf': 'America/Los_Angeles',
+            'california': 'America/Los_Angeles',
+        }
+        
+        if timezone_input.lower() in aliases:
+            return aliases[timezone_input.lower()]
+            
+        # Use LLM if available
+        if self.intelligent_scheduler:
+            try:
+                print(f"Resolving timezone for '{timezone_input}'...")
+                response = self.intelligent_scheduler.client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": "You are a timezone resolver. Return ONLY the IANA timezone string for the given location or abbreviation. If unknown, return 'UTC'."},
+                        {"role": "user", "content": f"Timezone for: {timezone_input}"}
+                    ],
+                    temperature=0
+                )
+                resolved = response.choices[0].message.content.strip()
+                # Verify it's valid
+                try:
+                    ZoneInfo(resolved)
+                    print(f"Resolved '{timezone_input}' to '{resolved}'")
+                    return resolved
+                except Exception:
+                    print(f"LLM returned invalid timezone: {resolved}")
+            except Exception as e:
+                print(f"Error resolving timezone with LLM: {e}")
+        
+        print(f"Could not resolve timezone '{timezone_input}', defaulting to UTC")
+        return 'UTC'
+
+    def schedule_meeting(self, duration_minutes=60, days_ahead=14, timezone_str='UTC', 
+                        excluded_dates=None, excluded_days=None, specific_dates=None):
         """
         Suggest time slots for scheduling a meeting.
         
         Args:
             duration_minutes: Duration of the meeting
             days_ahead: Number of days to look ahead
+            timezone_str: Target timezone
+            excluded_dates: Dates to exclude
+            excluded_days: Days of week to exclude
+            specific_dates: Specific dates to include
         
         Returns:
             Dictionary with available and conflict-possible slots
         """
-        print(f"\nLooking for {duration_minutes}-minute time slots in the next {days_ahead} days...")
+        if specific_dates:
+            print(f"\nLooking for {duration_minutes}-minute time slots on specific dates: {', '.join(specific_dates)} ({timezone_str})...")
+        else:
+            print(f"\nLooking for {duration_minutes}-minute time slots in the next {days_ahead} days ({timezone_str})...")
+        
+        # Detect user's system timezone
+        user_timezone = 'UTC'
+        try:
+            # Try to get system local timezone
+            import time
+            system_tz = str(datetime.now().astimezone().tzinfo)
+            # Resolve it to ensure it's a valid IANA string (e.g. PST -> America/Los_Angeles)
+            user_timezone = self.resolve_timezone(system_tz)
+        except Exception:
+            pass
+            
         slots = self.calendar.suggest_time_slots(
             duration_minutes=duration_minutes,
-            days_ahead=days_ahead
+            days_ahead=days_ahead,
+            timezone_str=timezone_str,
+            excluded_dates=excluded_dates,
+            excluded_days=excluded_days,
+            user_timezone=user_timezone,
+            specific_dates=specific_dates
         )
         
-        return slots
+        return slots, user_timezone
     
     def get_tasks(self, months_ahead=None):
         """
@@ -75,25 +167,49 @@ class ScheduleAgent:
         """
         return self.payment_reminder.check_payment_reminders()
     
-    def print_schedule_suggestions(self, duration_minutes=60, days_ahead=14):
+    def print_schedule_suggestions(self, duration_minutes=60, days_ahead=14, timezone_str='UTC', 
+                                 excluded_dates=None, excluded_days=None, specific_dates=None):
         """Print formatted schedule suggestions."""
-        slots = self.schedule_meeting(duration_minutes, days_ahead)
+        slots, user_timezone = self.schedule_meeting(duration_minutes, days_ahead, timezone_str, excluded_dates, excluded_days, specific_dates)
         
         print("\n" + "="*60)
-        print("SCHEDULE SUGGESTIONS")
+        print(f"SCHEDULE SUGGESTIONS (Your TZ: {user_timezone})")
         print("="*60)
+        
+        if specific_dates:
+            print(f"📅 Showing slots for specific dates: {', '.join(specific_dates)}")
         
         if slots['available']:
             print("\n✅ AVAILABLE SLOTS (No conflicts):")
-            for i, (start, end) in enumerate(slots['available'], 1):
-                print(f"  {i}. {start.strftime('%Y-%m-%d %H:%M')} - {end.strftime('%H:%M')}")
+            
+            # Check if any reasonable slots exist
+            reasonable_slots = [s for s in slots['available'] if s['is_reasonable']]
+            unreasonable_slots = [s for s in slots['available'] if not s['is_reasonable']]
+            
+            if not reasonable_slots and unreasonable_slots:
+                print("⚠️  CAUTION: No slots found within reasonable waking hours (7 AM - 10 PM) in your timezone.")
+                print("   Here are the available slots anyway:")
+            
+            for i, slot_data in enumerate(slots['available'], 1):
+                user_start, user_end = slot_data['user_slot']
+                target_start, target_end = slot_data['target_slot']
+                is_reasonable = slot_data['is_reasonable']
+                
+                warning = "" if is_reasonable else " ⚠️  (Late/Early)"
+                
+                print(f"  {i}. {user_start.strftime('%Y-%m-%d %H:%M')} - {user_end.strftime('%H:%M')} {user_timezone}{warning}")
+                print(f"     (Target: {target_start.strftime('%H:%M')} - {target_end.strftime('%H:%M')} {timezone_str})")
         
         if slots['conflict_possible']:
             print("\n⚠️  SLOTS WITH POTENTIAL CONFLICTS (Movable events):")
             for i, slot_info in enumerate(slots['conflict_possible'], 1):
-                start, end = slot_info['slot']
+                slot_data = slot_info['slot']
+                user_start, user_end = slot_data['user_slot']
+                target_start, target_end = slot_data['target_slot']
                 conflict_start, conflict_end = slot_info['conflict_with']
-                print(f"  {i}. {start.strftime('%Y-%m-%d %H:%M')} - {end.strftime('%H:%M')}")
+                
+                print(f"  {i}. {user_start.strftime('%Y-%m-%d %H:%M')} - {user_end.strftime('%H:%M')} {user_timezone}")
+                print(f"     (Target: {target_start.strftime('%H:%M')} - {target_end.strftime('%H:%M')} {timezone_str})")
                 print(f"     ⚠️  Conflicts with: {conflict_start.strftime('%Y-%m-%d %H:%M')} - {conflict_end.strftime('%H:%M')}")
                 print(f"     💡 {slot_info['note']}")
         
@@ -270,12 +386,15 @@ class ScheduleAgent:
         print("SCHEDULE AGENT - Interactive Mode")
         print("="*60)
         print("\nCommands:")
-        print("  1. schedule [duration] [days] - Get schedule suggestions")
-        print("  2. smart \"[request]\" [days] - Intelligent scheduling with prep planning")
+        print("  1. schedule [duration] [in days] [timezone/country] - Get schedule suggestions")
+        print("     Options: date=YYYY-MM-DD (specific date), ex_date=YYYY-MM-DD (exclude date), ex_day=0-6 (exclude day)")
+        print("     Example: schedule 60 14 India ex_day=6")
+        print("     Example: schedule 60 date=2025-12-25 date=2025-12-26")
+        print("  2. smart \"[request]\" [in days] [timezone/country] - Intelligent scheduling with prep planning")
         print("     Example: smart \"30 minutes interview with exec John at Company X\" 14")
-        print("  3. check [days] - Check for new events needing prep (default: 30 days)")
-        print("  4. monitor [minutes] - Continuously monitor calendar (default: 60 min)")
-        print("  5. tasks [months] - Get to-do tasks")
+        print("  3. check [in days] [timezone/country] - Check for new events needing prep (default: 30 days)")
+        print("  4. monitor [minutes] [timezone/country] - Continuously monitor calendar (default: 60 min)")
+        print("  5. tasks [months] [timezone/country] - Get to-do tasks")
         print("  6. payments - Get payment reminders")
         print("  7. all - Show everything")
         print("  8. help - Show this help")
@@ -291,8 +410,9 @@ class ScheduleAgent:
                     break
                 elif command == 'help':
                     print("\nCommands:")
-                    print("  schedule [duration] [days] - Get schedule suggestions")
-                    print("    Example: schedule 60 14 (60 minutes, 14 days ahead)")
+                    print("  schedule [duration] [days] [timezone] [ex_date=YYYY-MM-DD] [ex_day=0-6] - Get schedule suggestions")
+                    print("    Example: schedule 60 14 India (60 mins, 14 days, India time)")
+                    print("    Example: schedule 60 India (60 mins, default 14 days, India time)")
                     print("  smart \"[request]\" [days] - Intelligent scheduling with prep planning")
                     print("    Example: smart \"30 minutes interview with exec John at Company X\" 14")
                     print("  check [days] - Check for new events needing prep (default: 30 days)")
@@ -304,8 +424,38 @@ class ScheduleAgent:
                 elif command.startswith('schedule'):
                     parts = command.split()
                     duration = int(parts[1]) if len(parts) > 1 else 60
-                    days = int(parts[2]) if len(parts) > 2 else 14
-                    self.print_schedule_suggestions(duration, days)
+                    days = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 14
+                    
+                    # Flexible timezone parsing
+                    # If 3rd arg is not a digit, it might be a timezone
+                    timezone_input = 'UTC'
+                    if len(parts) > 2 and not parts[2].isdigit():
+                         # schedule 60 India
+                         timezone_input = parts[2]
+                    elif len(parts) > 3 and not parts[3].startswith('tz=') and not parts[3].startswith('ex_'):
+                         # schedule 60 14 India
+                         timezone_input = parts[3]
+                    
+                    # Parse optional args (tz=..., ex_date=...)
+                    excluded_dates = []
+                    excluded_days = []
+                    specific_dates = []
+                    
+                    for part in parts[1:]:
+                        if part.startswith('tz='):
+                            timezone_input = part.split('=')[1]
+                        elif part.startswith('ex_date='):
+                            excluded_dates.append(part.split('=')[1])
+                        elif part.startswith('ex_day='):
+                            try:
+                                excluded_days.append(int(part.split('=')[1]))
+                            except ValueError:
+                                pass
+                        elif part.startswith('date='):
+                            specific_dates.append(part.split('=')[1])
+                    
+                    timezone_str = self.resolve_timezone(timezone_input)
+                    self.print_schedule_suggestions(duration, days, timezone_str, excluded_dates, excluded_days, specific_dates)
                 elif command.startswith('smart'):
                     # Parse smart command: smart "request" [days]
                     parts = command.split('"', 2)
@@ -369,8 +519,35 @@ def main():
         
         if command == 'schedule':
             duration = int(sys.argv[2]) if len(sys.argv) > 2 else 60
-            days = int(sys.argv[3]) if len(sys.argv) > 3 else 14
-            agent.print_schedule_suggestions(duration, days)
+            days = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else 14
+            
+            # Flexible timezone parsing
+            timezone_input = 'UTC'
+            if len(sys.argv) > 3 and not sys.argv[3].isdigit():
+                 timezone_input = sys.argv[3]
+            elif len(sys.argv) > 4 and not sys.argv[4].startswith('tz=') and not sys.argv[4].startswith('ex_'):
+                 timezone_input = sys.argv[4]
+            
+            # Parse optional args
+            excluded_dates = []
+            excluded_days = []
+            specific_dates = []
+            
+            for arg in sys.argv[2:]:
+                if arg.startswith('tz='):
+                    timezone_input = arg.split('=')[1]
+                elif arg.startswith('ex_date='):
+                    excluded_dates.append(arg.split('=')[1])
+                elif arg.startswith('ex_day='):
+                    try:
+                        excluded_days.append(int(arg.split('=')[1]))
+                    except ValueError:
+                        pass
+                elif arg.startswith('date='):
+                    specific_dates.append(arg.split('=')[1])
+            
+            timezone_str = agent.resolve_timezone(timezone_input)
+            agent.print_schedule_suggestions(duration, days, timezone_str, excluded_dates, excluded_days, specific_dates)
         elif command == 'smart':
             if len(sys.argv) < 3:
                 print("Usage: python agent.py smart \"[request]\" [days]")

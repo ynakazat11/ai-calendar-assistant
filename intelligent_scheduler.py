@@ -3,7 +3,7 @@ Intelligent scheduler that analyzes meeting requests, gathers information,
 plans preparation, and suggests optimal scheduling times.
 """
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from openai import OpenAI
 from duckduckgo_search import DDGS
@@ -241,24 +241,57 @@ Return only valid JSON, no additional text."""
         event_duration = parsed_request.get('duration_minutes', 30)
         total_prep_hours = prep_plan.get('total_prep_hours', 2)
         
+        # Calculate minimum lead time based on prep hours
+        # Heuristic: 1 day lead time per 2 hours of prep, minimum 2 days if any prep needed
+        min_lead_days = 0
+        if total_prep_hours > 0:
+            min_lead_days = max(2, int(total_prep_hours / 2))
+        
+        # Adjust start date for suggestion search
+        # We want to look for slots starting from now + min_lead_days
+        now = datetime.now(timezone.utc)
+        search_start_date = now + timedelta(days=min_lead_days)
+        
         # Get available slots for the event
         event_slots = self.calendar.suggest_time_slots(
             duration_minutes=event_duration,
+            start_date=search_start_date,
             days_ahead=days_ahead
         )
         
         # For each event slot, find prep time slots before it
         suggestions = []
         
-        for slot in event_slots['available'][:5]:  # Top 5 slots
-            event_start, event_end = slot
+        for slot_data in event_slots['available'][:5]:  # Top 5 slots
+            # Handle new slot structure (dict) vs old (tuple)
+            if isinstance(slot_data, dict):
+                event_start, event_end = slot_data['target_slot']
+            else:
+                event_start, event_end = slot_data
+                
             # Find prep time slots before the event (at least 1 day before, up to 3 days before)
-            prep_start_date = event_start - timedelta(days=3)
-            prep_end_date = event_start - timedelta(days=1)
-            
-            # Calculate prep slots needed
             prep_tasks = prep_plan.get('prep_tasks', [])
             prep_slots = []
+            
+            # Determine prep start time
+            # Must be at least now
+            now = datetime.now(timezone.utc)
+            
+            # Ideally start 3 days before, but not in the past
+            ideal_prep_start = event_start - timedelta(days=3)
+            prep_start_date = max(ideal_prep_start, now)
+            
+            # Prep must end before event starts (give 1 hour buffer)
+            prep_end_date = event_start - timedelta(hours=1)
+            
+            # If we don't have enough time for prep (e.g. event is today/tomorrow),
+            # we might need to squeeze it in.
+            if prep_start_date > prep_end_date:
+                # Event is very soon. Start prep immediately.
+                prep_start_date = now
+                # If still invalid (event in past?), just use now
+                if prep_start_date > prep_end_date:
+                     prep_end_date = event_start # Prep right up to event
             
             # Try to schedule prep tasks before the event
             current_prep_time = prep_start_date
@@ -287,7 +320,7 @@ Return only valid JSON, no additional text."""
                     })
             
             suggestions.append({
-                'event_slot': slot,
+                'event_slot': (event_start, event_end),
                 'prep_slots': prep_slots,
                 'total_prep_hours': total_prep_hours
             })

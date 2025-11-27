@@ -73,25 +73,54 @@ On first run, the agent will:
 ## Usage
 
 ### Interactive Mode
-
 Run the agent in interactive mode:
-
 ```bash
 python agent.py
 ```
-
 Commands:
-- `schedule [duration] [days]` - Get schedule suggestions (e.g., `schedule 60 14`)
-- `smart "[request]" [days]` - **NEW!** Intelligent scheduling with prep planning
-  - Example: `smart "30 minutes interview with exec John at Company X" 14`
+- `schedule [duration] [days] [timezone]` - Get suggestions (e.g., `schedule 60 14 India`)
+  - Options: `date=YYYY-MM-DD`, `ex_date=YYYY-MM-DD`, `ex_day=0-6`
+- `smart "[request]" [days] [timezone]` - Intelligent scheduling (e.g., `smart "meeting with John" 14`)
+- `check [days]` - Check for upcoming events needing prep
+- `monitor` - Run in background monitoring mode
+
+### Command Line
+Quick schedule check:
+```bash
+# Basic usage
+python agent.py schedule 60 14
+
+# With timezone (e.g., India)
+python agent.py schedule 60 14 India
+
+# Specific dates
+python agent.py schedule 60 date=2025-12-25 date=2025-12-26
+
+# Exclude weekends (Sat=5, Sun=6) and specific date
+python agent.py schedule 60 14 ex_day=5 ex_day=6 ex_date=2025-12-25
+```
+
+### Features
+
+#### 🌍 Smart Timezone Support
+- **Flexible Input**: Use country names ("India"), cities ("Tokyo"), or codes ("PST").
+- **Cross-Timezone Scheduling**: Searches in the target timezone but displays results in **your local timezone**.
+- **Reasonable Hours Check**: Warns if a slot is outside 7 AM - 10 PM in your local time.
+
+#### 📅 Advanced Scheduling
+- **Specific Dates**: Request slots for specific days using `date=YYYY-MM-DD`.
+- **Exclusions**: Exclude specific dates (`ex_date`) or days of the week (`ex_day`).
+- **Smart Prep**: Automatically schedules preparation time for important meetings, ensuring enough lead time.
+- `smart "[request]" [days] [timezone]` - **NEW!** Intelligent scheduling with prep planning
+  - Example: `smart "30 minutes interview with exec John at Company X" 14 India`
   - Automatically gathers info, plans prep, and suggests optimal times
-- `check [days]` - **NEW!** Check for new events in calendar needing prep (default: 30 days)
+- `check [days] [timezone]` - **NEW!** Check for new events in calendar needing prep (default: 30 days)
   - Automatically detects interviews, tournaments, presentations, etc.
   - Creates prep events for newly added calendar events
-- `monitor [minutes]` - **NEW!** Continuously monitor calendar (default: 60 min)
+- `monitor [minutes] [timezone]` - **NEW!** Continuously monitor calendar (default: 60 min)
   - Runs in background checking for new events periodically
-- `tasks [months]` - Get to-do tasks (default: 3 months)
-- `payments` - Get payment reminders
+- `tasks [months] [timezone]` - Get to-do tasks (default: 3 months)
+- `payments [timezone]` - Get payment reminders
 - `all` - Show everything
 - `help` - Show help
 - `quit` - Exit

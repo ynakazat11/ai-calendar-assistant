@@ -5,6 +5,10 @@ Uses OAuth2 for authentication - no passwords stored.
 import os
 import pickle
 from datetime import datetime, timedelta, timezone
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -196,7 +200,9 @@ class CalendarManager:
         
         return busy_times
     
-    def suggest_time_slots(self, duration_minutes=60, start_date=None, days_ahead=14):
+    def suggest_time_slots(self, duration_minutes=60, start_date=None, days_ahead=14, 
+                          timezone_str='UTC', excluded_dates=None, excluded_days=None,
+                          user_timezone='UTC', specific_dates=None):
         """
         Suggest available time slots for scheduling.
         Also suggests slots with potential conflicts (movable events).
@@ -205,16 +211,92 @@ class CalendarManager:
             duration_minutes: Duration of the meeting in minutes
             start_date: datetime to start looking from (default: now)
             days_ahead: Number of days ahead to look
+            timezone_str: Target timezone string (e.g., 'Asia/Kolkata')
+            excluded_dates: List of dates to exclude (YYYY-MM-DD)
+            excluded_days: List of days of week to exclude (0=Monday, 6=Sunday)
+            user_timezone: User's local timezone string (e.g., 'America/Los_Angeles')
+            specific_dates: List of specific dates to schedule on (YYYY-MM-DD). If provided, days_ahead is ignored.
         
         Returns:
-            Dictionary with 'available' and 'conflict_possible' time slots
+            Dictionary with 'available' and 'conflict_possible' time slots.
+            Each slot is now a dictionary containing:
+            - target_slot: (start, end) in target timezone
+            - user_slot: (start, end) in user timezone
+            - is_reasonable: boolean (7 AM - 10 PM in user timezone)
         """
+        if excluded_dates is None:
+            excluded_dates = []
+        if excluded_days is None:
+            excluded_days = []
+        if specific_dates is None:
+            specific_dates = []
+            
+        try:
+            target_tz = ZoneInfo(timezone_str)
+        except Exception:
+            print(f"Warning: Invalid target timezone '{timezone_str}', falling back to UTC")
+            target_tz = timezone.utc
+            
+        try:
+            user_tz = ZoneInfo(user_timezone)
+        except Exception:
+            print(f"Warning: Invalid user timezone '{user_timezone}', falling back to UTC")
+            user_tz = timezone.utc
+
         if start_date is None:
-            start_date = datetime.now(timezone.utc).replace(hour=9, minute=0, second=0, microsecond=0)
+            # Start from now in target timezone
+            start_date = datetime.now(target_tz).replace(hour=9, minute=0, second=0, microsecond=0)
         else:
-            start_date = self._normalize_datetime(start_date)
+            start_date = self._normalize_datetime(start_date).astimezone(target_tz)
         
-        end_date = start_date + timedelta(days=days_ahead)
+        # If specific dates are provided, we don't use days_ahead logic in the same way
+        # Instead, we'll check each specific date
+        if specific_dates:
+            # We still need a range for get_busy_times, so let's find min and max of specific dates
+            # But specific_dates are strings, need to convert to dates relative to target_tz
+            pass # Logic handled inside loop or by pre-calculating range
+            
+            # Actually, let's just determine the overall range to fetch busy times once
+            # It's more efficient than fetching for each day
+            sorted_dates = sorted(specific_dates)
+            try:
+                min_date_str = sorted_dates[0]
+                max_date_str = sorted_dates[-1]
+                
+                # Parse as date objects
+                min_date = datetime.strptime(min_date_str, '%Y-%m-%d').date()
+                max_date = datetime.strptime(max_date_str, '%Y-%m-%d').date()
+                
+                # Create datetime range in target_tz
+                # Start of min_date
+                range_start = datetime.combine(min_date, datetime.min.time()).replace(tzinfo=target_tz)
+                # End of max_date
+                range_end = datetime.combine(max_date, datetime.max.time()).replace(tzinfo=target_tz)
+                
+                # Ensure range_start is not before start_date (which defaults to now)
+                # Unless user specifically asked for a past date? (Usually we shouldn't allow past)
+                # But let's respect start_date if it's "now"
+                if range_start < start_date:
+                    # If specific date is today, we might start from now
+                    if range_start.date() == start_date.date():
+                        range_start = start_date
+                    else:
+                        # If it's strictly in the past, we might want to skip or show error?
+                        # For now, let's just use the requested date start (00:00) 
+                        # but get_busy_times will handle it.
+                        # However, the loop below checks `current < end_date`.
+                        pass
+                
+                end_date = range_end
+                
+                # We will iterate differently if specific_dates is set
+            except ValueError:
+                print("Error parsing specific dates. Ignoring.")
+                specific_dates = []
+                end_date = start_date + timedelta(days=days_ahead)
+        else:
+            end_date = start_date + timedelta(days=days_ahead)
+            
         busy_times = self.get_busy_times(start_date, end_date)
         
         # Normalize all busy times to timezone-aware
@@ -229,66 +311,204 @@ class CalendarManager:
         conflict_slots = []
         
         # Working hours: 9 AM to 6 PM
-        current = start_date
-        
-        while current < end_date:
-            # Skip weekends
-            if current.weekday() >= 5:
-                current += timedelta(days=1)
-                current = current.replace(hour=9, minute=0)
-                continue
+        if specific_dates:
+            # Iterate through each specific date
+            for date_str in specific_dates:
+                try:
+                    target_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+                    # Start at 9 AM on that date in target_tz
+                    # We need to handle DST correctly, so use proper timezone conversion if needed
+                    # But simpler: create naive datetime and localize
+                    # Actually, we already have target_tz.
+                    
+                    # Create a datetime at 9 AM on that date
+                    # We need to be careful about creating it directly with tzinfo if it's not fixed offset
+                    # Best way: datetime.combine(date, time) -> replace(tzinfo=None) -> astimezone(target_tz) ??
+                    # No, target_tz is a ZoneInfo.
+                    
+                    # Correct way with ZoneInfo:
+                    dt_naive = datetime.combine(target_date, datetime.min.time())
+                    # We want 9 AM in that timezone.
+                    # Let's start at 00:00 and loop, skipping non-working hours?
+                    # Or just jump to 9 AM?
+                    
+                    # Let's construct 9 AM in target timezone
+                    # This might be tricky if 9 AM doesn't exist (DST gap), but rare for 9 AM.
+                    
+                    # Let's use a helper to get start of day in target tz
+                    # We can assume the date string is meant for the target timezone.
+                    
+                    # Construct 9 AM
+                    current = datetime.combine(target_date, datetime.min.time().replace(hour=9)).replace(tzinfo=target_tz)
+                    
+                    # If this specific date is today, and now is past 9 AM, start from now
+                    if current < start_date:
+                        current = start_date
+                        # Round up to next 30 min
+                        if current.minute >= 30:
+                            current = current.replace(minute=0) + timedelta(hours=1)
+                        elif current.minute > 0:
+                            current = current.replace(minute=30)
+                    
+                    # End of this working day (6 PM)
+                    day_end = datetime.combine(target_date, datetime.min.time().replace(hour=18)).replace(tzinfo=target_tz)
+                    
+                    while current < day_end:
+                        # Logic inside loop is same as below, refactor?
+                        # Or just copy-paste for safety/speed now.
+                        
+                        slot_end = current + duration
+                        
+                        if slot_end > day_end:
+                            break
+                            
+                        # Check conflicts (same logic)
+                        has_conflict = False
+                        conflict_event = None
+                        
+                        for busy_start, busy_end in busy_times:
+                            if (current < busy_end and slot_end > busy_start):
+                                has_conflict = True
+                                conflict_event = (busy_start, busy_end)
+                                break
+                        
+                        if not has_conflict:
+                            # Calculate user time and reasonableness
+                            user_start = current.astimezone(user_tz)
+                            user_end = slot_end.astimezone(user_tz)
+                            is_reasonable = 7 <= user_start.hour < 22
+                            
+                            available_slots.append({
+                                'target_slot': (current, slot_end),
+                                'user_slot': (user_start, user_end),
+                                'is_reasonable': is_reasonable
+                            })
+                        else:
+                            conflict_duration = conflict_event[1] - conflict_event[0]
+                            if conflict_duration < timedelta(hours=2):
+                                user_start = current.astimezone(user_tz)
+                                user_end = slot_end.astimezone(user_tz)
+                                is_reasonable = 7 <= user_start.hour < 22
+                                
+                                conflict_slots.append({
+                                    'slot': {
+                                        'target_slot': (current, slot_end),
+                                        'user_slot': (user_start, user_end),
+                                        'is_reasonable': is_reasonable
+                                    },
+                                    'conflict_with': conflict_event,
+                                    'note': 'Short event - might be movable'
+                                })
+                        
+                        current += timedelta(minutes=30)
+                        
+                except ValueError:
+                    continue
+                    
+        else:
+            # Original loop for days_ahead
+            current = start_date
             
-            # Skip outside working hours
-            if current.hour < 9:
-                current = current.replace(hour=9, minute=0)
-            elif current.hour >= 18:
-                current += timedelta(days=1)
-                current = current.replace(hour=9, minute=0)
-                continue
-            
-            slot_end = current + duration
-            
-            # Check if slot conflicts with existing events
-            has_conflict = False
-            conflict_event = None
-            
-            for busy_start, busy_end in busy_times:
-                # Check for overlap
-                if (current < busy_end and slot_end > busy_start):
-                    has_conflict = True
-                    conflict_event = (busy_start, busy_end)
-                    break
-            
-            if not has_conflict:
-                available_slots.append((current, slot_end))
-            else:
-                # Check if the conflicting event might be movable
-                # (e.g., not an all-day event, not too long)
-                conflict_duration = conflict_event[1] - conflict_event[0]
-                if conflict_duration < timedelta(hours=2):  # Short events might be movable
-                    conflict_slots.append({
-                        'slot': (current, slot_end),
-                        'conflict_with': conflict_event,
-                        'note': 'Short event - might be movable'
+            while current < end_date:
+                # Check exclusions
+                if current.weekday() in excluded_days:
+                    current += timedelta(days=1)
+                    current = current.replace(hour=9, minute=0)
+                    continue
+                    
+                current_date_str = current.strftime('%Y-%m-%d')
+                if current_date_str in excluded_dates:
+                    current += timedelta(days=1)
+                    current = current.replace(hour=9, minute=0)
+                    continue
+
+                # Skip weekends (unless explicitly allowed - but keeping default behavior for now + user exclusions)
+                if current.weekday() >= 5:
+                    current += timedelta(days=1)
+                    current = current.replace(hour=9, minute=0)
+                    continue
+                
+                # Skip outside working hours (9 AM - 6 PM in the requested timezone)
+                if current.hour < 9:
+                    current = current.replace(hour=9, minute=0)
+                elif current.hour >= 18:
+                    current += timedelta(days=1)
+                    current = current.replace(hour=9, minute=0)
+                    continue
+                
+                slot_end = current + duration
+                
+                # Check if slot conflicts with existing events
+                has_conflict = False
+                conflict_event = None
+                
+                for busy_start, busy_end in busy_times:
+                    # Check for overlap
+                    if (current < busy_end and slot_end > busy_start):
+                        has_conflict = True
+                        conflict_event = (busy_start, busy_end)
+                        break
+                
+                if not has_conflict:
+                    # Calculate user time and reasonableness
+                    user_start = current.astimezone(user_tz)
+                    user_end = slot_end.astimezone(user_tz)
+                    
+                    # Reasonable hours: 7 AM to 10 PM
+                    is_reasonable = 7 <= user_start.hour < 22
+                    
+                    available_slots.append({
+                        'target_slot': (current, slot_end),
+                        'user_slot': (user_start, user_end),
+                        'is_reasonable': is_reasonable
                     })
-            
-            # Move to next potential slot (30-minute increments)
-            current += timedelta(minutes=30)
+                else:
+                    # Check if the conflicting event might be movable
+                    # (e.g., not an all-day event, not too long)
+                    conflict_duration = conflict_event[1] - conflict_event[0]
+                    if conflict_duration < timedelta(hours=2):  # Short events might be movable
+                        user_start = current.astimezone(user_tz)
+                        user_end = slot_end.astimezone(user_tz)
+                        is_reasonable = 7 <= user_start.hour < 22
+                        
+                        conflict_slots.append({
+                            'slot': {
+                                'target_slot': (current, slot_end),
+                                'user_slot': (user_start, user_end),
+                                'is_reasonable': is_reasonable
+                            },
+                            'conflict_with': conflict_event,
+                            'note': 'Short event - might be movable'
+                        })
+                
+                # Move to next potential slot (30-minute increments)
+                current += timedelta(minutes=30)
         
         # Add conflict resolution suggestions
+        # (Keep existing logic, but ensure it handles the new slot structure if needed)
+        # The existing logic uses conflict_slots which we populated correctly above.
+        
         conflict_resolutions = []
         if conflict_slots:
             # Suggest alternative times near conflicts
             for conflict_info in conflict_slots[:3]:
                 conflict_start, conflict_end = conflict_info['conflict_with']
-                slot_start, slot_end = conflict_info['slot']
+                slot_data = conflict_info['slot']
+                slot_start, slot_end = slot_data['target_slot']
                 
                 # Suggest time before conflict
                 before_suggestion = conflict_start - duration
+                # Check if before_suggestion is within working hours/days?
+                # For simplicity, just check hours
                 if before_suggestion >= start_date and before_suggestion.hour >= 9 and before_suggestion.hour < 18:
+                    user_before = before_suggestion.astimezone(user_tz)
                     conflict_resolutions.append({
                         'type': 'before_conflict',
-                        'suggested_time': (before_suggestion, before_suggestion + duration),
+                        'suggested_time': {
+                            'target_slot': (before_suggestion, before_suggestion + duration),
+                            'user_slot': (user_before, user_before + duration),
+                            'is_reasonable': 7 <= user_before.hour < 22
+                        },
                         'conflict_with': conflict_info['conflict_with'],
                         'note': f"Schedule before {conflict_start.strftime('%H:%M')} to avoid conflict"
                     })
@@ -296,9 +516,14 @@ class CalendarManager:
                 # Suggest time after conflict
                 after_suggestion = conflict_end
                 if after_suggestion + duration <= end_date and after_suggestion.hour >= 9 and after_suggestion.hour < 18:
+                    user_after = after_suggestion.astimezone(user_tz)
                     conflict_resolutions.append({
                         'type': 'after_conflict',
-                        'suggested_time': (after_suggestion, after_suggestion + duration),
+                        'suggested_time': {
+                            'target_slot': (after_suggestion, after_suggestion + duration),
+                            'user_slot': (user_after, user_after + duration),
+                            'is_reasonable': 7 <= user_after.hour < 22
+                        },
                         'conflict_with': conflict_info['conflict_with'],
                         'note': f"Schedule after {conflict_end.strftime('%H:%M')} to avoid conflict"
                     })

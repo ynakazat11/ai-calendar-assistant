@@ -25,6 +25,7 @@ wheels/
 *.egg
 test*
 TEST*
+verify*
 
 # Environment variables
 .env
