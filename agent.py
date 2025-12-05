@@ -253,38 +253,34 @@ class ScheduleAgent:
         
         self._print_intelligent_schedule_result(result)
         
-        # Ask user if they want to create prep events
+        # Ask user if they want to create events
         if not auto_create_prep and result['suggestions']['suggestions']:
             print("\n" + "="*60)
-            response = input("Would you like to create prep events for one of these suggestions? (yes/no): ").strip().lower()
+            response = input("Would you like to create events for one of these suggestions? (yes/no): ").strip().lower()
             if response in ['yes', 'y']:
-                self._create_prep_events_interactive(result)
+                self._create_dependent_events_interactive(result)
     
     def _print_intelligent_schedule_result(self, result: dict):
         """Print formatted intelligent schedule results."""
         parsed = result['parsed_request']
-        prep_plan = result['prep_plan']
         suggestions = result['suggestions']['suggestions']
         
         print("\n" + "="*60)
         print("INTELLIGENT SCHEDULE SUGGESTIONS")
         print("="*60)
         
-        print(f"\n📋 PREPARATION PLAN")
-        print(f"   Total prep time needed: {prep_plan.get('total_prep_hours', 0)} hours")
-        print(f"   Number of prep tasks: {len(prep_plan.get('prep_tasks', []))}")
+        primary = parsed.get('primary_task', {})
+        dependents = parsed.get('dependent_tasks', [])
         
-        if prep_plan.get('prep_tasks'):
-            print("\n   Prep Tasks:")
-            for i, task in enumerate(prep_plan.get('prep_tasks', []), 1):
-                print(f"   {i}. {task.get('task', 'N/A')} ({task.get('duration_hours', 0)} hours)")
-                if task.get('description'):
-                    print(f"      {task.get('description', '')[:80]}...")
-        
-        if prep_plan.get('key_talking_points'):
-            print("\n   Key Talking Points:")
-            for point in prep_plan.get('key_talking_points', [])[:5]:
-                print(f"   • {point}")
+        print(f"\n📋 PLAN SUMMARY")
+        print(f"   Primary Task: {primary.get('description', 'Task')}")
+        print(f"   Duration: {primary.get('duration_minutes', 0)} minutes")
+        if dependents:
+            print(f"   Dependent Tasks: {len(dependents)}")
+            for i, task in enumerate(dependents, 1):
+                print(f"   {i}. {task.get('description', 'Task')} ({task.get('duration_minutes', 0)} min)")
+                if task.get('relation'):
+                    print(f"      Relation: {task.get('relation')}")
         
         print(f"\n📅 SCHEDULE SUGGESTIONS")
         
@@ -293,60 +289,66 @@ class ScheduleAgent:
             return
         
         for i, suggestion in enumerate(suggestions, 1):
-            event_start, event_end = suggestion['event_slot']
-            print(f"\n   Option {i}:")
-            print(f"   📍 Event: {event_start.strftime('%Y-%m-%d %H:%M')} - {event_end.strftime('%H:%M')}")
-            print(f"   ⏱️  Prep time: {suggestion['total_prep_hours']} hours")
+            p_start, p_end = suggestion['primary_slot']
+            p_tz = suggestion['primary_timezone']
             
-            prep_slots = suggestion['prep_slots']
-            if prep_slots:
-                print(f"   📚 Prep schedule:")
-                for prep_item in prep_slots:
-                    task = prep_item['task']
-                    slot = prep_item.get('slot')
-                    if slot:
-                        prep_start, prep_end = slot
-                        print(f"      • {task.get('task', 'Prep')}: {prep_start.strftime('%Y-%m-%d %H:%M')} - {prep_end.strftime('%H:%M')}")
-                    else:
-                        suggested = prep_item.get('suggested_time', 'TBD')
-                        print(f"      • {task.get('task', 'Prep')}: {suggested} (flexible)")
+            print(f"\n   Option {i}:")
+            print(f"   📍 Primary: {p_start.strftime('%Y-%m-%d %H:%M')} - {p_end.strftime('%H:%M')} ({p_tz})")
+            
+            if suggestion.get('dependent_slots'):
+                print("      Dependent Tasks:")
+                for dep in suggestion['dependent_slots']:
+                    d_start, d_end = dep['slot']
+                    d_tz = dep['timezone']
+                    print(f"      • {dep['description']}: {d_start.strftime('%Y-%m-%d %H:%M')} - {d_end.strftime('%H:%M')} ({d_tz})")
     
-    def _create_prep_events_interactive(self, result: dict):
-        """Interactive prep event creation."""
+    def _create_dependent_events_interactive(self, result: dict):
+        """Interactive flow to create events from suggestions."""
         suggestions = result['suggestions']['suggestions']
         
-        if not suggestions:
-            print("No suggestions available.")
-            return
-        
-        print("\nSelect which option to create prep events for:")
-        for i, suggestion in enumerate(suggestions, 1):
-            event_start, _ = suggestion['event_slot']
-            print(f"  {i}. Event on {event_start.strftime('%Y-%m-%d %H:%M')}")
-        
-        try:
-            choice = int(input("Enter option number: ").strip())
-            if 1 <= choice <= len(suggestions):
-                selected = suggestions[choice - 1]
+        while True:
+            try:
+                choice = input("\nEnter suggestion number to create events (or 'q' to quit): ").strip()
+                if choice.lower() == 'q':
+                    break
                 
-                # Create prep events
-                created = self.intelligent_scheduler.create_prep_events(
-                    selected,
-                    result['parsed_request'],
-                    result['gathered_info'],
-                    result['prep_plan']
-                )
-                
-                if created:
-                    print(f"\n✅ Created {len(created)} prep event(s) in your calendar!")
+                idx = int(choice) - 1
+                if 0 <= idx < len(suggestions):
+                    selected = suggestions[idx]
+                    
+                    # Create primary event
+                    p_start, p_end = selected['primary_slot']
+                    parsed = result['parsed_request']
+                    primary = parsed.get('primary_task', {})
+                    
+                    print(f"\nCreating primary event: {primary.get('description')}...")
+                    self.calendar_manager.create_event(
+                        title=primary.get('description', 'Meeting'),
+                        start_time=p_start,
+                        end_time=p_end,
+                        description=f"Scheduled via AI Agent\nContext: {parsed.get('context', {})}"
+                    )
+                    
+                    # Create dependent events
+                    if selected.get('dependent_slots'):
+                        print("Creating dependent events...")
+                        for dep in selected['dependent_slots']:
+                            d_start, d_end = dep['slot']
+                            self.calendar_manager.create_event(
+                                title=f"{dep['description']} ({primary.get('description')})",
+                                start_time=d_start,
+                                end_time=d_end,
+                                description=f"Dependent task for: {primary.get('description')}"
+                            )
+                    
+                    print("\n✅ All events created successfully!")
+                    break
                 else:
-                    print("\n❌ Failed to create prep events.")
-            else:
-                print("Invalid option.")
-        except ValueError:
-            print("Invalid input.")
-        except Exception as e:
-            print(f"Error: {e}")
+                    print("Invalid selection.")
+            except ValueError:
+                print("Invalid input.")
+            except Exception as e:
+                print(f"Error: {e}")
     
     def check_new_events(self, days_ahead: int = 30, auto_create: bool = True):
         """

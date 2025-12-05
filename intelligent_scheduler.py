@@ -34,14 +34,18 @@ class IntelligentScheduler:
         Returns:
             Dictionary with parsed information
         """
-        prompt = f"""Parse the following scheduling request and extract key information.
+        prompt = f"""Parse the following scheduling request into a structured plan with a primary task and optional dependent tasks.
 Return a JSON object with the following fields:
-- event_type: Type of event (e.g., "interview", "meeting", "call")
-- duration_minutes: Duration in minutes (extract from request or default to 30)
-- person_name: Name of the person (if mentioned)
-- company_name: Name of the company (if mentioned)
-- event_description: Brief description of the event
-- additional_context: Any other relevant information
+- primary_task: Object containing:
+    - description: Task description
+    - duration_minutes: Duration in minutes
+    - constraints: Object with 'timezone', 'time_preference', and 'min_days_ahead' (int, optional)
+- dependent_tasks: List of objects, each containing:
+    - description: Task description
+    - duration_minutes: Duration
+    - relation: Relationship to primary (e.g. 'before', 'after')
+    - constraints: Object with 'timezone' and 'time_preference'
+- context: Object containing extracted entities if present (person_name, company_name, event_type)
 
 Request: "{request}"
 
@@ -74,12 +78,17 @@ Return only valid JSON, no additional text."""
             duration = duration * 60
         
         return {
-            'event_type': 'meeting',
-            'duration_minutes': duration,
-            'person_name': None,
-            'company_name': None,
-            'event_description': request,
-            'additional_context': ''
+            'primary_task': {
+                'description': request,
+                'duration_minutes': duration,
+                'constraints': {}
+            },
+            'dependent_tasks': [],
+            'context': {
+                'event_type': 'meeting',
+                'person_name': None,
+                'company_name': None
+            }
         }
     
     def gather_information(self, person_name: Optional[str], company_name: Optional[str], 
@@ -134,8 +143,9 @@ Return only valid JSON, no additional text."""
                         info['event_specific_info'] += '\n'.join([r['body'] for r in results])
                         info['prep_resources'].extend([r['href'] for r in results[:2]])
         except Exception as e:
-            print(f"⚠️  Warning: Error during web search: {e}")
-            print("   Continuing with limited information...")
+            # Catch all exceptions including Ratelimit to prevent crashing
+            print(f"⚠️  Warning: Web search failed (possibly rate limited). Continuing without external info.")
+            # print(f"   Debug error: {e}") # Uncomment for debugging
         
         return info
     
@@ -225,212 +235,186 @@ Return only valid JSON, no additional text."""
                 'recommended_prep_schedule': 'Complete prep 1-2 days before the event'
             }
     
-    def suggest_schedule_with_prep(self, parsed_request: Dict, prep_plan: Dict, 
+    def suggest_complex_schedule(self, parsed_request: Dict, prep_plan: Dict = None, 
                                   days_ahead: int = 14) -> Dict:
         """
-        Suggest schedule times accounting for preparation time needed.
+        Suggest schedule for a primary task and its dependencies.
         
         Args:
-            parsed_request: Parsed request information
-            prep_plan: Preparation plan with time estimates
+            parsed_request: Parsed request with primary_task and dependent_tasks
+            prep_plan: Optional prep plan (legacy/compatibility)
             days_ahead: Number of days to look ahead
         
         Returns:
-            Dictionary with suggested slots and prep schedule
+            Dictionary with suggested slots
         """
-        event_duration = parsed_request.get('duration_minutes', 30)
-        total_prep_hours = prep_plan.get('total_prep_hours', 2)
+        primary = parsed_request.get('primary_task', {})
+        dependents = parsed_request.get('dependent_tasks', [])
         
-        # Calculate minimum lead time based on prep hours
-        # Heuristic: 1 day lead time per 2 hours of prep, minimum 2 days if any prep needed
-        min_lead_days = 0
-        if total_prep_hours > 0:
-            min_lead_days = max(2, int(total_prep_hours / 2))
+        # If prep_plan is provided (legacy flow), convert it to a dependent task if not already present
+        if prep_plan and not dependents:
+            total_prep = prep_plan.get('total_prep_hours', 0)
+            if total_prep > 0:
+                dependents.append({
+                    'description': 'Preparation',
+                    'duration_minutes': int(total_prep * 60),
+                    'relation': 'before',
+                    'constraints': {} # Default constraints
+                })
         
-        # Adjust start date for suggestion search
-        # We want to look for slots starting from now + min_lead_days
+        # 1. Find slots for Primary Task
+        p_duration = primary.get('duration_minutes', 30)
+        p_constraints = primary.get('constraints', {})
+        p_timezone = p_constraints.get('timezone', 'UTC')
+        p_time_pref = p_constraints.get('time_preference', '').lower()
+        p_min_days = p_constraints.get('min_days_ahead', 0)
+        
+        # Calculate start date based on dependencies (e.g. if prep needed, start later)
+        # Simple heuristic: if any 'before' dependency, push start date
+        start_delay_days = p_min_days
+        for dep in dependents:
+            if dep.get('relation') == 'before':
+                # Add 1 day delay per 2 hours of dependent task?
+                dur = dep.get('duration_minutes', 0)
+                if dur > 0:
+                    start_delay_days += max(1, int(dur / 120))
+        
         now = datetime.now(timezone.utc)
-        search_start_date = now + timedelta(days=min_lead_days)
+        search_start = now + timedelta(days=start_delay_days)
         
-        # Get available slots for the event
-        event_slots = self.calendar.suggest_time_slots(
-            duration_minutes=event_duration,
-            start_date=search_start_date,
-            days_ahead=days_ahead
+        print(f"Searching primary slots in {p_timezone} starting {search_start.strftime('%Y-%m-%d')}...")
+        
+        primary_slots = self.calendar.suggest_time_slots(
+            duration_minutes=p_duration,
+            start_date=search_start,
+            days_ahead=days_ahead,
+            timezone_str=p_timezone
         )
         
-        # For each event slot, find prep time slots before it
         suggestions = []
         
-        for slot_data in event_slots['available'][:5]:  # Top 5 slots
-            # Handle new slot structure (dict) vs old (tuple)
-            if isinstance(slot_data, dict):
-                event_start, event_end = slot_data['target_slot']
+        # 2. For each primary slot, try to schedule dependents
+        for p_slot_data in primary_slots['available'][:5]: # Top 5
+            if isinstance(p_slot_data, dict):
+                p_start, p_end = p_slot_data['target_slot']
+                p_user_start, p_user_end = p_slot_data['user_slot']
             else:
-                event_start, event_end = slot_data
+                p_start, p_end = p_slot_data
+                p_user_start = p_start # Fallback
+            
+            # Filter primary slot by time preference if needed
+            if p_time_pref and not self._check_time_preference(p_start, p_time_pref):
+                continue
+
+            valid_chain = True
+            chain_details = []
+            
+            for dep in dependents:
+                d_desc = dep.get('description', 'Task')
+                d_duration = dep.get('duration_minutes', 60)
+                d_relation = dep.get('relation', 'before')
+                d_constraints = dep.get('constraints', {})
+                d_timezone = d_constraints.get('timezone', p_timezone) # Default to primary TZ
+                d_time_pref = d_constraints.get('time_preference', '').lower()
                 
-            # Find prep time slots before the event (at least 1 day before, up to 3 days before)
-            prep_tasks = prep_plan.get('prep_tasks', [])
-            prep_slots = []
-            
-            # Determine prep start time
-            # Must be at least now
-            now = datetime.now(timezone.utc)
-            
-            # Ideally start 3 days before, but not in the past
-            ideal_prep_start = event_start - timedelta(days=3)
-            prep_start_date = max(ideal_prep_start, now)
-            
-            # Prep must end before event starts (give 1 hour buffer)
-            prep_end_date = event_start - timedelta(hours=1)
-            
-            # If we don't have enough time for prep (e.g. event is today/tomorrow),
-            # we might need to squeeze it in.
-            if prep_start_date > prep_end_date:
-                # Event is very soon. Start prep immediately.
-                prep_start_date = now
-                # If still invalid (event in past?), just use now
-                if prep_start_date > prep_end_date:
-                     prep_end_date = event_start # Prep right up to event
-            
-            # Try to schedule prep tasks before the event
-            current_prep_time = prep_start_date
-            for task in prep_tasks:
-                task_duration = int(task.get('duration_hours', 1) * 60)  # Convert to minutes
+                # Search window depends on relation
+                d_search_start = now
+                d_search_end = None
                 
-                # Find available slot for this prep task
-                prep_slot = self._find_prep_slot(
-                    current_prep_time, 
-                    prep_end_date, 
-                    task_duration
+                if d_relation == 'before':
+                    d_search_end = p_start
+                    # Ideally start looking from now
+                elif d_relation == 'after':
+                    d_search_start = p_end
+                    d_search_end = p_end + timedelta(days=7) # Look ahead 1 week
+                
+                # We need a way to search for a SINGLE slot for this dependent task
+                # reusing suggest_time_slots but we need to constrain the end date
+                # suggest_time_slots takes days_ahead, not end_date.
+                # We can approximate days_ahead.
+                
+                days_for_dep = 7
+                if d_search_end:
+                    delta = d_search_end - d_search_start
+                    days_for_dep = max(1, delta.days + 1)
+                
+                dep_slots = self.calendar.suggest_time_slots(
+                    duration_minutes=d_duration,
+                    start_date=d_search_start,
+                    days_ahead=days_for_dep,
+                    timezone_str=d_timezone
                 )
                 
-                if prep_slot:
-                    prep_slots.append({
-                        'task': task,
-                        'slot': prep_slot
+                # Find a valid slot for dependent
+                found_dep_slot = None
+                for d_slot_data in dep_slots['available']:
+                    if isinstance(d_slot_data, dict):
+                        ds_start, ds_end = d_slot_data['target_slot']
+                    else:
+                        ds_start, ds_end = d_slot_data
+                    
+                    # Check relation constraint strictly
+                    if d_relation == 'before' and ds_end > p_start:
+                        continue
+                    if d_relation == 'after' and ds_start < p_end:
+                        continue
+                        
+                    # Check time preference
+                    if d_time_pref and not self._check_time_preference(ds_start, d_time_pref):
+                        continue
+                    
+                    found_dep_slot = (ds_start, ds_end)
+                    break
+                
+                if found_dep_slot:
+                    chain_details.append({
+                        'description': d_desc,
+                        'slot': found_dep_slot,
+                        'timezone': d_timezone
                     })
-                    current_prep_time = prep_slot[1] + timedelta(hours=1)  # Next slot after this one
                 else:
-                    # If we can't find a slot, suggest a flexible time
-                    prep_slots.append({
-                        'task': task,
-                        'slot': None,
-                        'suggested_time': f"{prep_start_date.strftime('%Y-%m-%d')} (flexible)"
-                    })
-            
-            suggestions.append({
-                'event_slot': (event_start, event_end),
-                'prep_slots': prep_slots,
-                'total_prep_hours': total_prep_hours
-            })
-        
-        return {
-            'suggestions': suggestions,
-            'prep_plan': prep_plan
-        }
-    
-    def _find_prep_slot(self, start_date: datetime, end_date: datetime, 
-                       duration_minutes: int) -> Optional[Tuple[datetime, datetime]]:
-        """Find an available slot for prep work."""
-        # Get busy times in the range
-        busy_times = self.calendar.get_busy_times(start_date, end_date)
-        busy_times.sort(key=lambda x: x[0])
-        
-        duration = timedelta(minutes=duration_minutes)
-        current = start_date
-        
-        while current < end_date:
-            # Skip weekends
-            if current.weekday() >= 5:
-                current += timedelta(days=1)
-                current = current.replace(hour=9, minute=0)
-                continue
-            
-            # Skip outside working hours
-            if current.hour < 9:
-                current = current.replace(hour=9, minute=0)
-            elif current.hour >= 18:
-                current += timedelta(days=1)
-                current = current.replace(hour=9, minute=0)
-                continue
-            
-            slot_end = current + duration
-            
-            # Check for conflicts
-            has_conflict = False
-            for busy_start, busy_end in busy_times:
-                if (current < busy_end and slot_end > busy_start):
-                    has_conflict = True
+                    valid_chain = False
                     break
             
-            if not has_conflict:
-                return (current, slot_end)
+            if valid_chain:
+                suggestions.append({
+                    'primary_slot': (p_start, p_end),
+                    'primary_timezone': p_timezone,
+                    'dependent_slots': chain_details
+                })
+        
+        return {'suggestions': suggestions}
+                
+
+    def _check_time_preference(self, slot_start: datetime, preference: str) -> bool:
+        """Check if a slot matches the time preference."""
+        h = slot_start.hour
+        pref = preference.lower()
+        
+        if 'morning' in pref and h >= 12:
+            return False
+        if 'afternoon' in pref and (h < 12 or h >= 17):
+            return False
+        if 'evening' in pref and h < 17:
+            return False
+        if 'night' in pref and h < 19:
+            return False
             
-            # Move to next potential slot
-            current += timedelta(minutes=30)
-        
-        return None
-    
-    def create_prep_events(self, suggestion: Dict, parsed_request: Dict, 
-                          gathered_info: Dict, prep_plan: Dict) -> List[str]:
-        """
-        Create calendar events for preparation tasks.
-        
-        Args:
-            suggestion: Selected suggestion with event and prep slots
-            parsed_request: Parsed request information
-            gathered_info: Gathered information
-            prep_plan: Preparation plan
-        
-        Returns:
-            List of created event IDs
-        """
-        created_events = []
-        event_name = parsed_request.get('event_description', 'Meeting')
-        
-        # Create prep events
-        for prep_item in suggestion['prep_slots']:
-            task = prep_item['task']
-            slot = prep_item.get('slot')
-            
-            if slot:
-                prep_start, prep_end = slot
-                event_title = f"Prep: {task.get('task', 'Preparation')} - {event_name}"
+        # Handle "after X pm"
+        if 'after' in pref and 'pm' in pref:
+            try:
+                import re
+                m = re.search(r'after (\d+)', pref)
+                if m:
+                    limit = int(m.group(1))
+                    if limit < 12: limit += 12 # Assume PM
+                    if h < limit:
+                        return False
+            except:
+                pass
                 
-                # Create detailed description
-                description = f"""Preparation for: {event_name}
-                
-Task: {task.get('task', 'Preparation')}
-Duration: {task.get('duration_hours', 1)} hours
+        return True
 
-Description:
-{task.get('description', 'General preparation')}
-
-Resources:
-{chr(10).join(['- ' + r for r in task.get('resources', [])])}
-
-Key Talking Points:
-{chr(10).join(['- ' + p for p in prep_plan.get('key_talking_points', [])])}
-
-Gathered Information:
-Person: {parsed_request.get('person_name', 'N/A')}
-Company: {parsed_request.get('company_name', 'N/A')}
-"""
-                
-                event_id = self.calendar.create_event(
-                    title=event_title,
-                    start_time=prep_start,
-                    end_time=prep_end,
-                    description=description
-                )
-                
-                if event_id:
-                    created_events.append(event_id)
-                    print(f"✅ Created prep event: {event_title} at {prep_start.strftime('%Y-%m-%d %H:%M')}")
-        
-        return created_events
-    
     def schedule_intelligent(self, request: str, days_ahead: int = 14, 
                            auto_create_prep: bool = False) -> Dict:
         """
@@ -449,35 +433,29 @@ Company: {parsed_request.get('company_name', 'N/A')}
         # Step 1: Parse the request
         print("\n📝 Step 1: Parsing request...")
         parsed_request = self.parse_request(request)
-        print(f"   Event type: {parsed_request.get('event_type')}")
-        print(f"   Duration: {parsed_request.get('duration_minutes')} minutes")
-        if parsed_request.get('person_name'):
-            print(f"   Person: {parsed_request.get('person_name')}")
-        if parsed_request.get('company_name'):
-            print(f"   Company: {parsed_request.get('company_name')}")
+        primary = parsed_request.get('primary_task', {})
+        context = parsed_request.get('context', {})
         
-        # Step 2: Gather information
+        print(f"   Primary Task: {primary.get('description')}")
+        print(f"   Duration: {primary.get('duration_minutes')} minutes")
+        if context.get('person_name'):
+            print(f"   Person: {context.get('person_name')}")
+        
+        # Step 2: Gather information (Optional, mostly for context)
         print("\n🔍 Step 2: Gathering information...")
         gathered_info = self.gather_information(
-            parsed_request.get('person_name'),
-            parsed_request.get('company_name'),
-            parsed_request.get('event_type', 'meeting')
+            context.get('person_name'),
+            context.get('company_name'),
+            context.get('event_type', 'meeting')
         )
         
-        # Step 3: Plan preparation
-        print("\n📋 Step 3: Planning preparation...")
-        prep_plan = self.plan_preparation(parsed_request, gathered_info)
-        print(f"   Estimated prep time: {prep_plan.get('total_prep_hours', 0)} hours")
-        print(f"   Prep tasks: {len(prep_plan.get('prep_tasks', []))}")
-        
-        # Step 4: Suggest schedule with prep
-        print("\n📅 Step 4: Finding optimal schedule...")
-        suggestions = self.suggest_schedule_with_prep(parsed_request, prep_plan, days_ahead)
+        # Step 3: Suggest schedule
+        print("\n📅 Step 3: Finding optimal schedule...")
+        suggestions = self.suggest_complex_schedule(parsed_request, days_ahead=days_ahead)
         
         return {
             'parsed_request': parsed_request,
             'gathered_info': gathered_info,
-            'prep_plan': prep_plan,
             'suggestions': suggestions,
             'auto_create_prep': auto_create_prep
         }
